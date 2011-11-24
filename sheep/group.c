@@ -23,6 +23,9 @@
 #include "logger.h"
 #include "work.h"
 #include "cluster.h"
+#include "coroutine.h"
+
+static struct coroutine *cdrv_co;
 
 struct node {
 	struct sheepdog_node_list_entry ent;
@@ -246,22 +249,27 @@ void do_cluster_request(struct work *work, int idx)
 	free(msg);
 }
 
+static void group_handler(int listen_fd, int events, void *data);
+
+static void cluster_dispatch(void *opaque)
+{
+	int fd = *(int *)opaque;
+
+	unregister_event(fd);
+
+	if (sys->cdrv->dispatch() != 0)
+		panic("oops... an error occurred inside corosync\n");
+
+	register_event(fd, group_handler, NULL);
+}
+
 static void group_handler(int listen_fd, int events, void *data)
 {
-	int ret;
-	if (events & EPOLLHUP) {
-		eprintf("received EPOLLHUP event: has corosync exited?\n");
-		goto out;
-	}
+	if (events & EPOLLHUP)
+		panic("received EPOLLHUP event: has corosync exited?\n");
 
-	ret = sys->cdrv->dispatch();
-	if (ret == 0)
-		return;
-	else
-		eprintf("oops... an error occurred inside corosync\n");
-out:
-	log_close();
-	exit(1);
+	cdrv_co = coroutine_create(cluster_dispatch);
+	coroutine_enter(cdrv_co, &listen_fd);
 }
 
 static inline int get_nodes_nr_from(struct list_head *l)
@@ -644,6 +652,8 @@ static void sd_notify_handler(struct sheepdog_node_list_entry *sender,
 	list_add_tail(&cevent->cpg_event_list, &sys->cpg_event_siblings);
 
 	start_cpg_event_work();
+
+	coroutine_yield();
 }
 
 /*
@@ -941,6 +951,8 @@ static void cpg_event_done(struct work *work, int idx)
 	cpg_event_free(cevent);
 	cpg_event_running = 0;
 
+	coroutine_enter(cdrv_co, NULL);
+
 	if (!list_empty(&sys->cpg_event_siblings))
 		start_cpg_event_work();
 }
@@ -1199,6 +1211,9 @@ static void sd_join_handler(struct sheepdog_node_list_entry *joined,
 
 		list_add_tail(&cevent->cpg_event_list, &sys->cpg_event_siblings);
 		start_cpg_event_work();
+
+		coroutine_yield();
+
 		break;
 	case CJ_RES_FAIL:
 	case CJ_RES_JOIN_LATER:
@@ -1315,6 +1330,8 @@ static void sd_leave_handler(struct sheepdog_node_list_entry *left,
 
 	list_add_tail(&cevent->cpg_event_list, &sys->cpg_event_siblings);
 	start_cpg_event_work();
+
+	coroutine_yield();
 
 	return;
 oom:
